@@ -13,6 +13,8 @@ import sys
 import httpx
 from mcp.server.fastmcp import FastMCP
 
+import off  # Open Food Facts authoritative grade lookup (sibling module)
+
 BASE_URL = "https://kassal.app/api/v1"
 mcp = FastMCP("kassalapp")
 
@@ -447,11 +449,34 @@ def nutrition_grade(
     else:  # /id shape
         prod = d
     name = prod.get("name")
+
+    # Prefer the official Open Food Facts grade when the product is in OFF. Skip
+    # it when the caller passed an override, which is meant to steer the local
+    # estimate. Any OFF error (rate limit, outage) falls through to local.
+    ean_for_off = ean or prod.get("ean")
+    if ean_for_off and kind_override is None and fvln_override is None:
+        try:
+            off_res = off.off_grade(str(ean_for_off))
+        except Exception:
+            off_res = None
+        if off_res:
+            return {
+                "name": name,
+                "ean": ean_for_off,
+                "grade": off_res["grade"],
+                "version": off_res.get("version"),
+                "categories_tags": off_res.get("categories_tags"),
+                "url": off_res.get("url"),
+                "source": "openfoodfacts",
+                "note": "official Open Food Facts Nutri-Score (2023)",
+            }
+
     res, missing = _score(prod, kind_override, fvln_override)
     if res is None:
         return {"name": name, "error": "not enough nutrition data to score",
                 "missing": missing}
     res["name"] = name
+    res["source"] = "local-estimate"
     return res
 
 

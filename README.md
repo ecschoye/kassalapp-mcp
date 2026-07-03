@@ -90,6 +90,21 @@ It is an **estimate**, not the official grade, because:
 
 The score is most reliable for comparing items **within a category** (e.g. all bread).
 
+### Official grade from Open Food Facts
+
+`nutrition_grade` prefers the **authoritative** Nutri-Score. When the product's barcode is
+in [Open Food Facts](https://world.openfoodfacts.org), it returns OFF's official 2023 grade
+and real category taxonomy (`source: "openfoodfacts"`), skipping the local estimate and its
+category guessing entirely. It falls back to the local FSA-NPS estimate
+(`source: "local-estimate"`) only when OFF does not have the product, or when you pass a
+`kind_override` / `fvln_override`.
+
+OFF limits reads to 15 requests/min, so results are cached on disk at
+`~/.cache/kassalapp-mcp/off.json` (override with `KASSALAPP_CACHE_DIR`). Cached entries are
+reused for **7 days**, then re-fetched to stay current. This cache is what lets repeated
+lookups bypass the rate limit. `rank_by_nutrition` stays on the local estimate because
+grading a 100-item list live would exceed the OFF rate limit.
+
 ## Notes
 
 - The API key is read from the `KASSALAPP_API_KEY` environment variable. It is never
