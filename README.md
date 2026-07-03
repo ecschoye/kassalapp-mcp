@@ -83,10 +83,12 @@ It is an **estimate**, not the official grade, because:
   that positive component is inferred from the product category. Whole produce categories
   get a high default so they are not unfairly penalised.
 - Ingredients are not parsed, so the 2023 non-nutritive-sweetener penalty is not applied.
-- The food type (beverage / fat / cheese / general) is inferred from the category name,
-  with a `kind_override` argument to correct it.
-- `rank_by_nutrition` ranks only within the fetched result set (up to 100 items), not the
-  whole catalogue.
+- The food type (beverage / fat / cheese / general) is classified from Open Food Facts
+  `categories_tags` when the product is in the local OFF cache (reliable), otherwise from
+  the Kassalapp category name. A `kind_override` argument forces it. Each result reports
+  `classified_by` (`off_tags` or `category_keywords`).
+- `rank_by_nutrition` ranks only within the fetched result set (paged up to the requested
+  `size`, capped at 300), not the whole catalogue.
 
 The score is most reliable for comparing items **within a category** (e.g. all bread).
 

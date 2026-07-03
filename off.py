@@ -6,90 +6,185 @@
 
 OFF publishes an official 2023 Nutri-Score grade and a proper category taxonomy
 per barcode, so we read it instead of guessing food type locally. Read limit is
-15 req/min/IP, so results are cached on disk and a rate guard protects bulk use.
+15 req/min/IP, so results are cached on disk (shared across processes with a file
+lock) and a file-backed rate guard keeps every process under the shared limit.
 """
+import atexit
 import json
 import os
 import sys
+import threading
 import time
+from contextlib import contextmanager
 
 import httpx
+
+try:
+    import fcntl  # POSIX only; used for cross-process cache/rate locking
+except ImportError:  # pragma: no cover - Windows fallback (no cross-proc lock)
+    fcntl = None
 
 BASE = "https://world.openfoodfacts.org"
 FIELDS = "code,product_name,nutriscore_grade,nutriscore_version,nutriscore,categories_tags"
 # OFF requires a descriptive User-Agent (AppName/Version (contact)).
 USER_AGENT = "kassalapp-mcp/0.2 (+https://github.com/ecschoye/kassalapp-mcp)"
-RATE_LIMIT = 15          # requests per window
-RATE_WINDOW = 60.0       # seconds
-CACHE_TTL = 7 * 24 * 3600  # entries older than 7 days are re-fetched
+RATE_LIMIT = 15               # requests per window (OFF product-read limit)
+RATE_WINDOW = 60.0            # seconds
+CACHE_TTL = 7 * 24 * 3600     # successful lookups re-fetched after 7 days
+MISS_TTL = 24 * 3600          # not-found lookups re-checked daily (may appear in OFF)
+STALE_MAX = 30 * 24 * 3600    # never serve cache older than this, even when rate-limited
+MAX_ENTRIES = 5000            # prune oldest entries beyond this to bound growth
 
 _client_ = None
-_cache = None
-_calls: list[float] = []
+_client_lock = threading.Lock()
 
 
 def _client() -> httpx.Client:
     global _client_
     if _client_ is None:
-        _client_ = httpx.Client(base_url=BASE, headers={"User-Agent": USER_AGENT},
-                                timeout=15.0)
+        with _client_lock:
+            if _client_ is None:
+                _client_ = httpx.Client(base_url=BASE, headers={"User-Agent": USER_AGENT},
+                                        timeout=15.0)
     return _client_
 
 
-def _cache_path() -> str:
-    base = os.environ.get("KASSALAPP_CACHE_DIR") or os.path.expanduser("~/.cache/kassalapp-mcp")
-    return os.path.join(base, "off.json")
-
-
-def _load_cache() -> dict:
-    global _cache
-    if _cache is None:
+@atexit.register
+def _close_client() -> None:
+    global _client_
+    if _client_ is not None:
         try:
-            with open(_cache_path(), encoding="utf-8") as f:
-                _cache = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            _cache = {}
-    return _cache
+            _client_.close()
+        finally:
+            _client_ = None
 
 
-def _save_cache(cache: dict) -> None:
-    p = _cache_path()
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    tmp = p + ".tmp"
+# --- paths ---------------------------------------------------------------
+
+def _dir() -> str:
+    return os.environ.get("KASSALAPP_CACHE_DIR") or os.path.expanduser("~/.cache/kassalapp-mcp")
+
+
+def _cache_path() -> str:
+    return os.path.join(_dir(), "off.json")
+
+
+def _rate_path() -> str:
+    return os.path.join(_dir(), "off_rate.json")
+
+
+def _lock_path() -> str:
+    return os.path.join(_dir(), "off.lock")
+
+
+# --- cross-process lock + json io ---------------------------------------
+
+@contextmanager
+def _locked():
+    """Hold an exclusive cross-process lock while reading/modifying the cache and
+    rate files. Falls back to a no-op lock where fcntl is unavailable."""
+    os.makedirs(_dir(), exist_ok=True)
+    if fcntl is None:
+        yield
+        return
+    f = open(_lock_path(), "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        finally:
+            f.close()
+
+
+def _read_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return default
+
+
+def _write_json(path, obj) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cache, f, ensure_ascii=False)
-    os.replace(tmp, p)
+        json.dump(obj, f, ensure_ascii=False)
+    os.replace(tmp, path)
 
 
-def _allow_request() -> bool:
-    """Sliding-window limiter: at most RATE_LIMIT calls per RATE_WINDOW seconds."""
-    now = time.monotonic()
-    cutoff = now - RATE_WINDOW
-    while _calls and _calls[0] < cutoff:
-        _calls.pop(0)
-    if len(_calls) >= RATE_LIMIT:
-        return False
-    _calls.append(now)
-    return True
+# --- freshness -----------------------------------------------------------
+
+def _age(entry):
+    """Seconds since the entry was fetched, or None if the entry is malformed."""
+    if not isinstance(entry, dict):
+        return None
+    ts = entry.get("fetched_at")
+    if not isinstance(ts, (int, float)):
+        return None
+    return time.time() - ts
+
+
+def _ttl(entry) -> float:
+    # Misses (data is None) expire faster than confirmed grades.
+    return MISS_TTL if entry.get("data") is None else CACHE_TTL
 
 
 def _fresh(entry) -> bool:
-    """True if a cache entry exists and is younger than CACHE_TTL."""
-    return isinstance(entry, dict) and (time.time() - entry.get("fetched_at", 0)) < CACHE_TTL
+    age = _age(entry)
+    return age is not None and age < _ttl(entry)
 
+
+def _stale_ok(entry) -> bool:
+    age = _age(entry)
+    return age is not None and age < STALE_MAX
+
+
+def _prune(cache: dict) -> None:
+    if len(cache) <= MAX_ENTRIES:
+        return
+    # keep the newest MAX_ENTRIES by fetched_at
+    ordered = sorted(cache.items(),
+                     key=lambda kv: (kv[1].get("fetched_at", 0) if isinstance(kv[1], dict) else 0),
+                     reverse=True)
+    cache.clear()
+    cache.update(dict(ordered[:MAX_ENTRIES]))
+
+
+# --- rate limiter (file-backed sliding window, shared across processes) ---
+
+def _reserve_slot_locked() -> bool:
+    """Must be called while holding _locked(). Returns True and records a call if
+    the shared window has room, else False."""
+    now = time.time()
+    calls = [t for t in _read_json(_rate_path(), []) if isinstance(t, (int, float))
+             and t > now - RATE_WINDOW]
+    if len(calls) >= RATE_LIMIT:
+        _write_json(_rate_path(), calls)
+        return False
+    calls.append(now)
+    _write_json(_rate_path(), calls)
+    return True
+
+
+# --- normalization -------------------------------------------------------
 
 def _normalize(product: dict, ean: str) -> dict | None:
-    grade = product.get("nutriscore_grade")
-    ns = product.get("nutriscore") or {}
+    ns = product.get("nutriscore")
     g2023 = ((ns.get("2023") or {}) if isinstance(ns, dict) else {}).get("grade")
-    grade = grade or g2023
+    top = product.get("nutriscore_grade")
+    # Prefer the explicit 2023 grade, since we label the result as 2023. Only fall
+    # back to the top-level grade (which may be an older version) when 2023 is absent.
+    grade = g2023 or top
     if not grade or grade in ("unknown", "not-applicable", ""):
         return None
+    version = "2023" if g2023 else product.get("nutriscore_version")
     return {
         "found": True,
         "ean": ean,
         "grade": grade.upper(),
-        "version": product.get("nutriscore_version"),
+        "version": version,
         "grade_2023": g2023.upper() if g2023 else None,
         "categories_tags": product.get("categories_tags") or [],
         "product_name": product.get("product_name"),
@@ -99,7 +194,9 @@ def _normalize(product: dict, ean: str) -> dict | None:
 
 
 def _fetch(ean: str) -> dict | None:
-    r = _client().get(f"/api/v2/product/{ean}.json", params={"fields": FIELDS})
+    # ean is a path segment; strip to digits so it cannot alter the URL path/query.
+    safe = "".join(ch for ch in ean if ch.isalnum())
+    r = _client().get(f"/api/v2/product/{safe}.json", params={"fields": FIELDS})
     if r.status_code == 404:
         return None
     r.raise_for_status()
@@ -109,87 +206,133 @@ def _fetch(ean: str) -> dict | None:
     return body["product"]
 
 
+class OffRateLimited(RuntimeError):
+    """Raised when the shared OFF rate window is exhausted and no usable cache exists."""
+
+
 def off_grade(ean, use_cache: bool = True) -> dict | None:
-    """Official OFF Nutri-Score + category for an EAN, or None if OFF lacks it."""
+    """Official OFF Nutri-Score + category for an EAN, or None if OFF lacks it.
+
+    Raises OffRateLimited only when the shared 15/min window is exhausted AND there
+    is no cache entry (fresh or within STALE_MAX) to serve instead.
+    """
     ean = str(ean).strip()
     if not ean:
         return None
-    cache = _load_cache()
-    entry = cache.get(ean)
-    if use_cache and _fresh(entry):
-        return entry.get("data")
-    if not _allow_request():
-        # rate limited: serve a stale cached answer if we have one, better than failing
-        if entry is not None:
+
+    with _locked():
+        cache = _read_json(_cache_path(), {})
+        entry = cache.get(ean)
+        if use_cache and _fresh(entry):
             return entry.get("data")
-        raise RuntimeError("Open Food Facts rate limit reached (15/min). Try again shortly.")
+        reserved = _reserve_slot_locked()
+        stale = entry if (not reserved and _stale_ok(entry)) else None
+
+    if not reserved:
+        if stale is not None:
+            return stale.get("data")
+        raise OffRateLimited("Open Food Facts rate limit reached (15/min). Try again shortly.")
+
     data = _fetch(ean)
     result = _normalize(data, ean) if data else None
-    cache[ean] = {"fetched_at": time.time(), "data": result}
-    _save_cache(cache)
+
+    with _locked():
+        cache = _read_json(_cache_path(), {})  # reload so we don't clobber other writers
+        cache[ean] = {"fetched_at": time.time(), "data": result}
+        _prune(cache)
+        _write_json(_cache_path(), cache)
     return result
 
 
-def off_grade_bulk(eans) -> dict:
-    """Look up many EANs, cache-first, network only within the rate budget.
+def cached_entry(ean) -> dict | None:
+    """Return a fresh cached OFF entry (grade + categories_tags) for an EAN, or
+    None. Never hits the network, so it is safe to call in bulk (e.g. ranking)."""
+    entry = _read_json(_cache_path(), {}).get(str(ean).strip())
+    return entry.get("data") if _fresh(entry) else None
 
-    Returns {ean: {"status": "cache"|"fetched"|"skipped_rate_limited", "result": ...}}.
+
+def off_grade_bulk(eans) -> dict:
+    """Look up many EANs, cache-first, network only within the shared rate budget.
+
+    Returns {ean: {"status": "cache"|"cache_stale"|"fetched"|"skipped_rate_limited",
+    "result": ...}}.
     """
     out = {}
-    cache = _load_cache()
-    dirty = False
-    for raw in eans:
-        ean = str(raw).strip()
-        if not ean:
-            continue
-        entry = cache.get(ean)
-        if _fresh(entry):
-            out[ean] = {"status": "cache", "result": entry.get("data")}
-            continue
-        if not _allow_request():
-            if entry is not None:  # stale but usable when we cannot refresh now
+    to_fetch = []
+    with _locked():
+        cache = _read_json(_cache_path(), {})
+        for raw in eans:
+            ean = str(raw).strip()
+            if not ean or ean in out:
+                continue
+            entry = cache.get(ean)
+            if _fresh(entry):
+                out[ean] = {"status": "cache", "result": entry.get("data")}
+            elif _reserve_slot_locked():
+                to_fetch.append(ean)
+            elif _stale_ok(entry):
                 out[ean] = {"status": "cache_stale", "result": entry.get("data")}
             else:
                 out[ean] = {"status": "skipped_rate_limited", "result": None}
-            continue
+
+    fetched = {}
+    for ean in to_fetch:
         data = _fetch(ean)
-        result = _normalize(data, ean) if data else None
-        cache[ean] = {"fetched_at": time.time(), "data": result}
-        dirty = True
-        out[ean] = {"status": "fetched", "result": result}
-    if dirty:
-        _save_cache(cache)
+        fetched[ean] = _normalize(data, ean) if data else None
+        out[ean] = {"status": "fetched", "result": fetched[ean]}
+
+    if fetched:
+        with _locked():
+            cache = _read_json(_cache_path(), {})
+            for ean, result in fetched.items():
+                cache[ean] = {"fetched_at": time.time(), "data": result}
+            _prune(cache)
+            _write_json(_cache_path(), cache)
     return out
 
 
 def _selftest() -> None:
-    # normalize a well-formed OFF product
-    sample = {"nutriscore_grade": "c", "nutriscore_version": "2023",
-              "nutriscore": {"2023": {"grade": "c"}},
-              "categories_tags": ["en:breads"], "product_name": "Test"}
-    n = _normalize(sample, "123")
+    # normalize: prefers the 2023 grade over a differing top-level grade
+    mixed = {"nutriscore_grade": "d", "nutriscore_version": "2021",
+             "nutriscore": {"2023": {"grade": "c"}}, "categories_tags": ["en:breads"]}
+    n = _normalize(mixed, "123")
     assert n and n["grade"] == "C" and n["version"] == "2023" and n["grade_2023"] == "C", n
-    assert n["categories_tags"] == ["en:breads"]
-    # falls back to the 2023 path when the top-level grade is absent
-    assert _normalize({"nutriscore": {"2023": {"grade": "a"}}}, "1")["grade"] == "A"
+    # falls back to top-level grade + its version when 2023 is absent
+    only21 = _normalize({"nutriscore_grade": "b", "nutriscore_version": "2021"}, "1")
+    assert only21["grade"] == "B" and only21["version"] == "2021", only21
     # unknown / missing grade -> None
     assert _normalize({"nutriscore_grade": "unknown"}, "1") is None
     assert _normalize({}, "1") is None
-    # cache freshness: fresh within TTL, stale past it
-    assert _fresh({"fetched_at": time.time()})
-    assert not _fresh({"fetched_at": time.time() - CACHE_TTL - 1})
+
+    # freshness: fresh within TTL, misses expire faster, malformed ts -> not fresh
+    assert _fresh({"fetched_at": time.time(), "data": {"grade": "A"}})
+    assert not _fresh({"fetched_at": time.time() - CACHE_TTL - 1, "data": {"grade": "A"}})
+    assert _fresh({"fetched_at": time.time() - MISS_TTL + 100, "data": None})
+    assert not _fresh({"fetched_at": time.time() - MISS_TTL - 1, "data": None})
+    assert not _fresh({"fetched_at": "oops"})
     assert not _fresh(None)
-    # rate limiter: 15 allowed, 16th blocked
-    global _calls
-    _calls = []
-    assert all(_allow_request() for _ in range(RATE_LIMIT))
-    assert not _allow_request()
+    assert _stale_ok({"fetched_at": time.time() - STALE_MAX + 100})
+    assert not _stale_ok({"fetched_at": time.time() - STALE_MAX - 1})
+
+    # prune keeps the newest MAX_ENTRIES
+    big = {str(i): {"fetched_at": i, "data": None} for i in range(MAX_ENTRIES + 10)}
+    _prune(big)
+    assert len(big) == MAX_ENTRIES and "9" not in big and str(MAX_ENTRIES + 9) in big
+
+    # file-backed rate limiter: 15 allowed, 16th blocked, shared via disk
+    os.environ.setdefault("KASSALAPP_CACHE_DIR",
+                           os.path.join(os.path.expanduser("~/.cache"), "kassalapp-mcp-selftest"))
+    _write_json(_rate_path(), [])
+    with _locked():
+        assert all(_reserve_slot_locked() for _ in range(RATE_LIMIT))
+        assert not _reserve_slot_locked()
+    _write_json(_rate_path(), [])  # reset
     print("off selftest ok (offline)")
 
     if "--live" in sys.argv:
-        _calls = []
+        _write_json(_rate_path(), [])
         r = off_grade("7039010019811", use_cache=False)  # Grandiosa
-        assert r and r["grade"] == "C" and r["version"] == "2023", r
+        assert r and r["grade"] == "C", r
         print("off live ok:", r["grade"], r["version"], r["categories_tags"][:2])
 
 
