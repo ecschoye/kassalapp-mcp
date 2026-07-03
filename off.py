@@ -25,11 +25,16 @@ except ImportError:  # pragma: no cover - Windows fallback (no cross-proc lock)
     fcntl = None
 
 BASE = "https://world.openfoodfacts.org"
-FIELDS = "code,product_name,nutriscore_grade,nutriscore_version,nutriscore,categories_tags"
+# Request the full nutriscore_data (grade + per-component points + is_* flags),
+# the versioned grade object, taxonomy tags, and the two complementary signals
+# (processing level, ingredient analysis). One call, everything we surface.
+FIELDS = ("code,product_name,nutriscore_grade,nutriscore_version,nutriscore,"
+          "nutriscore_data,categories_tags,nova_group,ingredients_analysis_tags")
 # OFF requires a descriptive User-Agent (AppName/Version (contact)).
 USER_AGENT = "kassalapp-mcp/0.2 (+https://github.com/ecschoye/kassalapp-mcp)"
 RATE_LIMIT = 15               # requests per window (OFF product-read limit)
 RATE_WINDOW = 60.0            # seconds
+SCHEMA = 2                    # bump to auto-invalidate cache entries on shape changes
 CACHE_TTL = 7 * 24 * 3600     # successful lookups re-fetched after 7 days
 MISS_TTL = 24 * 3600          # not-found lookups re-checked daily (may appear in OFF)
 STALE_MAX = 30 * 24 * 3600    # never serve cache older than this, even when rate-limited
@@ -132,6 +137,8 @@ def _ttl(entry) -> float:
 
 
 def _fresh(entry) -> bool:
+    if not isinstance(entry, dict) or entry.get("schema") != SCHEMA:
+        return False  # missing/old schema -> refetch
     age = _age(entry)
     return age is not None and age < _ttl(entry)
 
@@ -156,37 +163,89 @@ def _prune(cache: dict) -> None:
 
 def _reserve_slot_locked() -> bool:
     """Must be called while holding _locked(). Returns True and records a call if
-    the shared window has room, else False."""
+    the shared window has room, else False (no write on rejection)."""
     now = time.time()
     calls = [t for t in _read_json(_rate_path(), []) if isinstance(t, (int, float))
              and t > now - RATE_WINDOW]
     if len(calls) >= RATE_LIMIT:
-        _write_json(_rate_path(), calls)
         return False
     calls.append(now)
     _write_json(_rate_path(), calls)
     return True
 
 
+def _release_slot_locked() -> None:
+    """Refund the most recently reserved slot (e.g. when the fetch failed), so a
+    transient OFF outage does not burn the shared minute budget on failures."""
+    calls = _read_json(_rate_path(), [])
+    if calls:
+        calls.pop()
+        _write_json(_rate_path(), calls)
+
+
+def _graded(data):
+    """The OFF-official grade, or None if the cached entry exists but has no grade
+    (its tags/flags are still useful via cached_entry, but not as a grade)."""
+    return data if isinstance(data, dict) and data.get("grade") else None
+
+
 # --- normalization -------------------------------------------------------
 
+def _truthy(x) -> bool:
+    """OFF returns its is_* flags inconsistently (int 1, int 0, string '1'), and
+    bool('0') is True in Python, so parse explicitly rather than via truthiness."""
+    return str(x).strip().lower() in ("1", "true", "yes")
+
+
+def _components(nd: dict):
+    comps = nd.get("components")
+    if not isinstance(comps, dict):
+        return None
+    out = {}
+    for side in ("negative", "positive"):
+        out[side] = [
+            {"id": c.get("id"), "value": c.get("value"),
+             "points": c.get("points"), "points_max": c.get("points_max")}
+            for c in (comps.get(side) or []) if isinstance(c, dict)
+        ]
+    return out
+
+
 def _normalize(product: dict, ean: str) -> dict | None:
+    """Normalize an OFF product. Returns a rich entry when the product EXISTS in OFF
+    (even if it has no valid grade, so its tags/flags are still cached), or None when
+    the product is genuinely absent. The entry's `grade` is None for ungraded products."""
+    if not isinstance(product, dict):
+        return None
+    nd = product.get("nutriscore_data") if isinstance(product.get("nutriscore_data"), dict) else {}
     ns = product.get("nutriscore")
     g2023 = ((ns.get("2023") or {}) if isinstance(ns, dict) else {}).get("grade")
-    top = product.get("nutriscore_grade")
-    # Prefer the explicit 2023 grade, since we label the result as 2023. Only fall
-    # back to the top-level grade (which may be an older version) when 2023 is absent.
-    grade = g2023 or top
-    if not grade or grade in ("unknown", "not-applicable", ""):
-        return None
-    version = "2023" if g2023 else product.get("nutriscore_version")
+    # Prefer the explicit 2023 grade, then the versioned data grade, then top-level.
+    grade = g2023 or nd.get("grade") or product.get("nutriscore_grade")
+    has_grade = bool(grade) and grade not in ("unknown", "not-applicable", "")
+    tags = product.get("categories_tags") or []
+
+    if not (nd or tags or product.get("product_name")):
+        return None  # product genuinely not in OFF
+
     return {
         "found": True,
         "ean": ean,
-        "grade": grade.upper(),
-        "version": version,
-        "grade_2023": g2023.upper() if g2023 else None,
-        "categories_tags": product.get("categories_tags") or [],
+        "grade": grade.upper() if has_grade else None,
+        "version": "2023" if g2023 else product.get("nutriscore_version"),
+        "score": nd.get("score"),
+        "negative_points": nd.get("negative_points"),
+        "positive_points": nd.get("positive_points"),
+        "components": _components(nd),
+        "flags": {k: _truthy(nd.get(k)) for k in
+                  ("is_beverage", "is_water", "is_cheese",
+                   "is_fat_oil_nuts_seeds", "is_red_meat_product")},
+        "count_proteins": (_truthy(nd.get("count_proteins"))
+                           if nd.get("count_proteins") is not None else None),
+        "count_proteins_reason": nd.get("count_proteins_reason"),
+        "nova_group": product.get("nova_group"),
+        "ingredients_analysis_tags": product.get("ingredients_analysis_tags") or [],
+        "categories_tags": tags,
         "product_name": product.get("product_name"),
         "source": "openfoodfacts",
         "url": f"{BASE}/product/{ean}",
@@ -194,13 +253,16 @@ def _normalize(product: dict, ean: str) -> dict | None:
 
 
 def _fetch(ean: str) -> dict | None:
-    # ean is a path segment; strip to digits so it cannot alter the URL path/query.
+    # ean is a path segment; strip to alphanumerics so it cannot alter the URL.
     safe = "".join(ch for ch in ean if ch.isalnum())
     r = _client().get(f"/api/v2/product/{safe}.json", params={"fields": FIELDS})
     if r.status_code == 404:
         return None
     r.raise_for_status()
-    body = r.json()
+    try:
+        body = r.json()
+    except ValueError:  # non-JSON body (CDN error page, maintenance redirect)
+        return None
     if body.get("status") == 0 or "product" not in body:
         return None
     return body["product"]
@@ -224,24 +286,29 @@ def off_grade(ean, use_cache: bool = True) -> dict | None:
         cache = _read_json(_cache_path(), {})
         entry = cache.get(ean)
         if use_cache and _fresh(entry):
-            return entry.get("data")
+            return _graded(entry.get("data"))
         reserved = _reserve_slot_locked()
         stale = entry if (not reserved and _stale_ok(entry)) else None
 
     if not reserved:
         if stale is not None:
-            return stale.get("data")
+            return _graded(stale.get("data"))
         raise OffRateLimited("Open Food Facts rate limit reached (15/min). Try again shortly.")
 
-    data = _fetch(ean)
+    try:
+        data = _fetch(ean)
+    except Exception:
+        with _locked():
+            _release_slot_locked()  # fetch failed, do not burn the slot
+        raise
     result = _normalize(data, ean) if data else None
 
     with _locked():
         cache = _read_json(_cache_path(), {})  # reload so we don't clobber other writers
-        cache[ean] = {"fetched_at": time.time(), "data": result}
+        cache[ean] = {"fetched_at": time.time(), "schema": SCHEMA, "data": result}
         _prune(cache)
         _write_json(_cache_path(), cache)
-    return result
+    return _graded(result)
 
 
 def cached_entry(ean) -> dict | None:
@@ -277,39 +344,60 @@ def off_grade_bulk(eans) -> dict:
 
     fetched = {}
     for ean in to_fetch:
-        data = _fetch(ean)
+        try:
+            data = _fetch(ean)
+        except Exception as e:  # isolate: one failure must not abort the batch
+            with _locked():
+                _release_slot_locked()
+            out[ean] = {"status": "error", "result": None, "error": str(e)}
+            continue
         fetched[ean] = _normalize(data, ean) if data else None
-        out[ean] = {"status": "fetched", "result": fetched[ean]}
+        out[ean] = {"status": "fetched", "result": _graded(fetched[ean])}
 
     if fetched:
         with _locked():
             cache = _read_json(_cache_path(), {})
             for ean, result in fetched.items():
-                cache[ean] = {"fetched_at": time.time(), "data": result}
+                cache[ean] = {"fetched_at": time.time(), "schema": SCHEMA, "data": result}
             _prune(cache)
             _write_json(_cache_path(), cache)
     return out
 
 
 def _selftest() -> None:
-    # normalize: prefers the 2023 grade over a differing top-level grade
+    # flag parsing: OFF mixes int and string forms; bool() alone would misfire
+    assert _truthy(1) and _truthy("1") and _truthy("true")
+    assert not _truthy(0) and not _truthy("0") and not _truthy(None) and not _truthy("")
+
+    # normalize: prefers the 2023 grade, parses flags + components
     mixed = {"nutriscore_grade": "d", "nutriscore_version": "2021",
-             "nutriscore": {"2023": {"grade": "c"}}, "categories_tags": ["en:breads"]}
+             "nutriscore": {"2023": {"grade": "c"}}, "categories_tags": ["en:breads"],
+             "nova_group": 4,
+             "nutriscore_data": {"grade": "c", "score": 6, "is_water": "1", "is_beverage": 0,
+                                 "count_proteins": 1,
+                                 "components": {"negative": [{"id": "salt", "value": 0.8,
+                                                              "points": 4, "points_max": 20}],
+                                               "positive": [{"id": "fruits_vegetables_legumes",
+                                                             "value": 0, "points": 0, "points_max": 5}]}}}
     n = _normalize(mixed, "123")
-    assert n and n["grade"] == "C" and n["version"] == "2023" and n["grade_2023"] == "C", n
-    # falls back to top-level grade + its version when 2023 is absent
-    only21 = _normalize({"nutriscore_grade": "b", "nutriscore_version": "2021"}, "1")
-    assert only21["grade"] == "B" and only21["version"] == "2021", only21
-    # unknown / missing grade -> None
-    assert _normalize({"nutriscore_grade": "unknown"}, "1") is None
+    assert n["grade"] == "C" and n["version"] == "2023" and n["score"] == 6, n
+    assert n["flags"]["is_water"] is True and n["flags"]["is_beverage"] is False, n["flags"]
+    assert n["nova_group"] == 4 and n["count_proteins"] is True
+    assert n["components"]["negative"][0]["id"] == "salt", n["components"]
+    # ungraded product with tags is STILL cached (grade None), so tags/flags survive
+    ug = _normalize({"categories_tags": ["en:sodas"], "nutriscore_grade": "unknown"}, "9")
+    assert ug is not None and ug["grade"] is None and ug["categories_tags"] == ["en:sodas"], ug
+    assert _graded(ug) is None  # not usable as an official grade
+    # genuinely absent product -> None
     assert _normalize({}, "1") is None
 
     # freshness: fresh within TTL, misses expire faster, malformed ts -> not fresh
-    assert _fresh({"fetched_at": time.time(), "data": {"grade": "A"}})
-    assert not _fresh({"fetched_at": time.time() - CACHE_TTL - 1, "data": {"grade": "A"}})
-    assert _fresh({"fetched_at": time.time() - MISS_TTL + 100, "data": None})
-    assert not _fresh({"fetched_at": time.time() - MISS_TTL - 1, "data": None})
-    assert not _fresh({"fetched_at": "oops"})
+    assert _fresh({"fetched_at": time.time(), "schema": SCHEMA, "data": {"grade": "A"}})
+    assert not _fresh({"fetched_at": time.time() - CACHE_TTL - 1, "schema": SCHEMA, "data": {"grade": "A"}})
+    assert _fresh({"fetched_at": time.time() - MISS_TTL + 100, "schema": SCHEMA, "data": None})
+    assert not _fresh({"fetched_at": time.time() - MISS_TTL - 1, "schema": SCHEMA, "data": None})
+    assert not _fresh({"fetched_at": "oops", "schema": SCHEMA})
+    assert not _fresh({"fetched_at": time.time(), "data": {"grade": "A"}})  # no schema -> stale
     assert not _fresh(None)
     assert _stale_ok({"fetched_at": time.time() - STALE_MAX + 100})
     assert not _stale_ok({"fetched_at": time.time() - STALE_MAX - 1})

@@ -96,7 +96,11 @@ The score is most reliable for comparing items **within a category** (e.g. all b
 
 `nutrition_grade` prefers the **authoritative** Nutri-Score. When the product's barcode is
 in [Open Food Facts](https://world.openfoodfacts.org), it returns OFF's official 2023 grade
-and real category taxonomy (`source: "openfoodfacts"`), skipping the local estimate and its
+plus the full breakdown OFF publishes: the numeric `score`, the per-component point
+`components` (including the real fruit/vegetable/legume percentage and the diet-sweetener
+penalty), the `is_beverage/is_water/is_cheese/is_fat_oil_nuts_seeds/is_red_meat_product`
+flags, and the `nova_group` processing level. This is the real data behind the grade, not the
+local estimate and its
 category guessing entirely. It falls back to the local FSA-NPS estimate
 (`source: "local-estimate"`) only when OFF does not have the product, or when you pass a
 `kind_override` / `fvln_override`.

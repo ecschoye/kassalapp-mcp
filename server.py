@@ -7,8 +7,10 @@
 https://kassal.app/api/v1 -- product prices, nutrition, labels, store lookup,
 cross-store price comparison. Bearer-token auth, key from KASSALAPP_API_KEY.
 """
+import atexit
 import os
 import sys
+import threading
 import urllib.parse
 
 import httpx
@@ -20,22 +22,35 @@ BASE_URL = "https://kassal.app/api/v1"
 mcp = FastMCP("kassalapp")
 
 _client: httpx.Client | None = None
+_client_lock = threading.Lock()
 
 
 def _get_client() -> httpx.Client:
     global _client
     if _client is None:
-        key = os.environ.get("KASSALAPP_API_KEY")
-        if not key:
-            raise RuntimeError(
-                "KASSALAPP_API_KEY is not set. Put it in the MCP config env block."
-            )
-        _client = httpx.Client(
-            base_url=BASE_URL,
-            headers={"Authorization": f"Bearer {key}"},
-            timeout=30.0,
-        )
+        with _client_lock:  # double-checked: avoid two threads leaking a client
+            if _client is None:
+                key = os.environ.get("KASSALAPP_API_KEY")
+                if not key:
+                    raise RuntimeError(
+                        "KASSALAPP_API_KEY is not set. Put it in the MCP config env block."
+                    )
+                _client = httpx.Client(
+                    base_url=BASE_URL,
+                    headers={"Authorization": f"Bearer {key}"},
+                    timeout=30.0,
+                )
     return _client
+
+
+@atexit.register
+def _close_client() -> None:
+    global _client
+    if _client is not None:
+        try:
+            _client.close()
+        finally:
+            _client = None
 
 
 def _clean(params: dict) -> dict:
@@ -197,6 +212,8 @@ def price_history(eans: list[str], days: int = 180, aggregation: str | None = No
     days: how many days of history (default 180).
     aggregation: optional aggregation mode accepted by the API.
     """
+    if not eans:
+        return {"error": "eans must be a non-empty list of EAN barcode strings"}
     body = _clean({"eans": eans, "days": days, "aggregation": aggregation})
     return _post("/products/prices-bulk", body)
 
@@ -268,7 +285,7 @@ _NCODES = {
     "energy_kj": "energi_kj", "energy_kcal": "energi_kcal",
     "sat_fat": "mettet_fett", "sugars": "sukkerarter", "salt": "salt",
     "sodium": "natrium", "fiber": "kostfiber", "protein": "protein",
-    "fat": "fett_totalt",
+    "fat": "fett_totalt", "carbs": "karbohydrater",
 }
 
 
@@ -278,17 +295,31 @@ def _pts(value, key, ge=False):
     return sum(1 for t in _T[key] if (value >= t if ge else value > t))
 
 
+def _num(x):
+    """Coerce an amount to float, or None. Some feeds return numbers as strings."""
+    if isinstance(x, bool) or x is None:
+        return None
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
 def _kcal_floor(v):
     """Lower bound on kcal/100g from known macros (Atwater). None if too little
-    data. sugars is only part of carbohydrate, so this is a genuine floor."""
-    fat, protein, sugars = v.get("fat"), v.get("protein"), v.get("sugars")
+    data. Uses total carbohydrate when available, else sugars (a partial floor)."""
+    fat, protein = v.get("fat"), v.get("protein")
+    carb = v.get("carbs") if v.get("carbs") is not None else v.get("sugars")
     if fat is None and protein is None:
         return None
-    return 9 * (fat or 0) + 4 * (protein or 0) + 4 * (sugars or 0)
+    return 9 * (fat or 0) + 4 * (protein or 0) + 4 * (carb or 0)
 
 
 def _nutrients_100g(product):
-    raw = {n.get("code"): n.get("amount") for n in (product.get("nutrition") or [])}
+    raw = {}
+    for n in (product.get("nutrition") or []):
+        if isinstance(n, dict):  # skip malformed non-dict entries
+            raw[n.get("code")] = _num(n.get("amount"))
     v = {k: raw.get(code) for k, code in _NCODES.items()}
     if v["salt"] is None and v["sodium"] is not None:
         v["salt"] = v["sodium"] * 2.5  # salt(g) = sodium(g) * 2.5
@@ -325,8 +356,13 @@ _TAG_CHEESE = {"en:cheeses"}
 _TAG_FAT = {"en:fats", "en:vegetable-oils", "en:olive-oils", "en:nuts",
             "en:seeds", "en:margarines", "en:butters"}
 _TAG_REDMEAT = {"en:red-meats", "en:beef", "en:pork", "en:lamb-meats", "en:veals",
-                "en:game-meats"}
-_TAG_PRODUCE = {"en:fruits", "en:vegetables", "en:legumes", "en:nuts",
+                "en:game-meats", "en:horse-meat", "en:goat-meat", "en:camel-meat",
+                "en:kangaroo-meat", "en:donkey-meat"}
+# 2023 FVLN positive component is fruits/vegetables/legumes ONLY. The 2021 field
+# fruits_vegetables_nuts_colza_walnut_olive_oils was renamed to
+# fruits_vegetables_legumes in the OFF 2023 tables, i.e. nuts and oils no longer
+# earn positive points. So nuts are NOT produce here (they stay fat_oil_nut).
+_TAG_PRODUCE = {"en:fruits", "en:vegetables", "en:legumes",
                 "en:fresh-fruits", "en:fresh-vegetables", "en:frozen-vegetables"}
 
 # Keyword fallback (only when a product is NOT in the OFF cache). Matched against
@@ -340,9 +376,11 @@ _KW_CHEESE = {"ost", "oster"}
 _KW_FAT = {"olje", "oljer", "margarin", "smør", "matfett", "majones", "nøtter",
            "mandler", "peanøtter", "kokosfett", "fett"}
 _KW_REDMEAT = {"storfe", "svin", "svinekjøtt", "lam", "kjøttdeig", "biff",
-               "karbonade", "kjøttkaker", "vilt", "hjort", "elg", "reinsdyr", "kalv"}
+               "karbonade", "kjøttkaker", "vilt", "hjort", "elg", "reinsdyr",
+               "kalv", "hest", "geit"}
+# Nuts excluded: 2023 FVLN is fruits/vegetables/legumes only (nuts stay fat_oil_nut).
 _KW_PRODUCE = {"frukt", "grønnsaker", "grønnsak", "grønt", "bær", "salat",
-               "bønner", "linser", "erter", "belgfrukter", "nøtter", "mandler"}
+               "bønner", "linser", "erter", "belgfrukter"}
 
 
 def _kind_from_tags(tags):
@@ -371,7 +409,8 @@ def _fvln_from_tags(tags):
 def _cat_words(product):
     # Word tokens from category names only (curated), NOT the free-text product
     # name. Whole-word matching avoids the substring traps (ostekake, fruktyoghurt).
-    text = " ".join(c.get("name", "") for c in (product.get("category") or [])).lower()
+    names = [c.get("name", "") for c in (product.get("category") or []) if isinstance(c, dict)]
+    text = " ".join(names).lower()
     return {w for w in "".join(ch if ch.isalpha() else " " for ch in text).split()}
 
 
@@ -433,11 +472,12 @@ def _score(product, kind_override=None, fvln_override=None, tags=None):
     """
     v, missing = _nutrients_100g(product)
     kind = _food_kind(product, kind_override, tags)
-    # Added fats/oils are scored on the saturated-fat-to-total-fat ratio, so total
-    # fat is required for them, otherwise the ratio silently reads as 0 points.
-    required = ("energy_kj", "sat_fat", "sugars", "salt", "protein")
+    # Added fats/oils score energy from saturated fat (not total energy) and use the
+    # saturated-fat-to-total-fat ratio, so they need total fat but not energy_kj.
     if kind == "fat_oil_nut":
-        required = required + ("fat",)
+        required = ("sat_fat", "fat", "sugars", "salt", "protein")
+    else:
+        required = ("energy_kj", "sat_fat", "sugars", "salt", "protein")
     missing = [k for k in required if v.get(k) is None]
     if missing:
         return None, missing
@@ -470,7 +510,9 @@ def _score(product, kind_override=None, fvln_override=None, tags=None):
         fvln_pts = _pts(fvln, "fvln")
         protein_pts = _pts(v["protein"], "protein")
     fiber_pts = _pts(v["fiber"], "fiber")
-    if red and protein_pts > 2:
+    # Red-meat protein cap is a general-food rule (cheese/beverage always count
+    # protein in full; fats do not carry a meaningful protein score).
+    if red and kind == "general" and protein_pts > 2:
         protein_pts = 2
 
     if kind in ("beverage", "cheese"):
@@ -540,11 +582,17 @@ def rank_by_nutrition(
     """
     if kind_override is not None and kind_override not in _VALID_KINDS:
         return {"error": f"kind_override must be one of {_VALID_KINDS}"}
-    want = max(1, min(RANK_MAX, int(size) if str(size).lstrip("-").isdigit() else 50))
+    try:
+        want = max(1, min(RANK_MAX, int(float(size))))
+    except (TypeError, ValueError):
+        want = 50
     items, err = _fetch_products_paged(
         {"search": search, "store": store, "brand": brand, "category": category}, want)
     if err:
         return err
+    # Kassalapp lists the same product once per store, so paged results contain
+    # duplicate EANs. Collapse them, otherwise the ranking is padded with repeats.
+    items = _dedupe_by_ean(items)
     scored, skipped, off_classified = [], 0, 0
     for p in items:
         # OFF categories_tags from cache (no network) give reliable classification
@@ -605,7 +653,9 @@ def nutrition_grade(
     if kind_override is not None and kind_override not in _VALID_KINDS:
         return {"error": f"kind_override must be one of {_VALID_KINDS}"}
     if fvln_override is not None:
-        if not isinstance(fvln_override, (int, float)) or not 0 <= fvln_override <= 100:
+        if (isinstance(fvln_override, bool)  # bool is an int subclass, reject it
+                or not isinstance(fvln_override, (int, float))
+                or not 0 <= fvln_override <= 100):
             return {"error": "fvln_override must be a number between 0 and 100"}
 
     if ean:
@@ -642,15 +692,25 @@ def nutrition_grade(
             return {
                 "name": name,
                 "ean": ean_for_off,
+                "source": "openfoodfacts",
                 "grade": off_res["grade"],
                 "version": off_res.get("version"),
+                "score": off_res.get("score"),
+                "components": off_res.get("components"),
+                "flags": off_res.get("flags"),
+                "count_proteins": off_res.get("count_proteins"),
+                "nova_group": off_res.get("nova_group"),
+                "ingredients_analysis_tags": off_res.get("ingredients_analysis_tags"),
                 "categories_tags": off_res.get("categories_tags"),
                 "url": off_res.get("url"),
-                "source": "openfoodfacts",
-                "note": "official Open Food Facts Nutri-Score",
+                "note": "official Open Food Facts Nutri-Score (2023), full component breakdown",
             }
 
-    res, missing = _score(prod, kind_override, fvln_override)
+    # Local fallback: reuse OFF categories_tags from cache for classification if we
+    # have them (e.g. an OFF product the caller overrode, or an OFF error).
+    ce = off.cached_entry(ean_for_off) if ean_for_off else None
+    off_tags = ce.get("categories_tags") if ce else None
+    res, missing = _score(prod, kind_override, fvln_override, tags=off_tags)
     if res is None:
         return {"name": name, "error": "not enough nutrition data to score",
                 "missing": missing}
@@ -763,6 +823,32 @@ def _selftest() -> None:
                        "salt": 0.1, "kostfiber": 0, "protein": 5},
                       ["Yoghurt og syrnet"], "Fruktyoghurt"))
     assert fy["fvln_assumed"] == 0, fy
+
+    # --- 2023-boundary locks (correct for FSA-NPS 2023, NOT the 2021 algorithm) ---
+    # score exactly 0 is grade A in 2023 (2021 used <= -1); FVLN uses strict '>', so
+    # 80% earns 2 points and only >80% (whole produce=100) earns the full 5.
+    assert _grade(0, "general") == "A" and _grade(1, "general") == "B"
+    assert _pts(80, "fvln") == 2 and _pts(100, "fvln") == 5
+    # nuts are NOT part of the 2023 FVLN positive component
+    assert "en:nuts" not in _TAG_PRODUCE and "nøtter" not in _KW_PRODUCE
+    assert _fvln_from_tags(["en:nuts"]) == 0
+
+    # fat/oil with no energy_kj still scores (energy comes from saturated fat)
+    fo, _ = _score(mk({"mettet_fett": 14, "fett_totalt": 92, "sukkerarter": 0,
+                       "salt": 0, "protein": 0}, ["Olje"], "Rapsolje"))
+    assert fo is not None and fo["kind"] == "fat_oil_nut", fo
+
+    # robustness: string amounts coerced, non-dict entries skipped
+    vs, _ = _nutrients_100g({"nutrition": ["junk", {"code": "protein", "amount": "5.5"}]})
+    assert vs["protein"] == 5.5, vs["protein"]
+    assert _cat_words({"category": ["junk", {"name": "Brød"}]}) == {"brød"}
+
+    # carbs feed the kcal floor: a single 350 in the kJ slot on a high-carb food is
+    # really kcal and is detected and converted to ~1464 kJ.
+    vp, _ = _nutrients_100g(mk({"energi_kj": 350, "fett_totalt": 2, "protein": 12,
+                                "karbohydrater": 70, "sukkerarter": 3,
+                                "mettet_fett": 0.5, "salt": 0.5}))
+    assert vp["energy_kj"] > 1000, vp["energy_kj"]
 
     print("selftest ok")
 
