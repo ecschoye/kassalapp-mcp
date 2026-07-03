@@ -7,8 +7,8 @@
 https://kassal.app/api/v1 -- product prices, nutrition, labels, store lookup,
 cross-store price comparison. Bearer-token auth, key from KASSALAPP_API_KEY.
 """
-import atexit
 import os
+import re
 import sys
 import threading
 import urllib.parse
@@ -41,16 +41,6 @@ def _get_client() -> httpx.Client:
                     timeout=30.0,
                 )
     return _client
-
-
-@atexit.register
-def _close_client() -> None:
-    global _client
-    if _client is not None:
-        try:
-            _client.close()
-        finally:
-            _client = None
 
 
 def _clean(params: dict) -> dict:
@@ -99,16 +89,18 @@ def _get(path: str, params: dict | None = None):
     return _handle(lambda: _get_client().get(path, params=_clean(params or {})))
 
 
-def _post(path: str, json: dict):
-    return _handle(lambda: _get_client().post(path, json=json))
+def _post(path: str, body: dict):
+    return _handle(lambda: _get_client().post(path, json=body))
 
 
-def _clamp_size(size: int) -> int:
-    """Kassalapp accepts size 1-100; clamp so out-of-range never 422s or over-fetches."""
+def _clamp_int(value, hi: int, default: int, lo: int = 1) -> int:
+    """Coerce value to an int within [lo, hi], falling back to default on junk.
+    One coercion policy for every size-like argument (accepts ints and numeric
+    strings/floats, e.g. "50" or 50.0)."""
     try:
-        return max(1, min(100, int(size)))
-    except (TypeError, ValueError):
-        return 20
+        return max(lo, min(hi, int(float(value))))
+    except (TypeError, ValueError, OverflowError):  # OverflowError: int(float("inf"))
+        return default
 
 
 @mcp.tool()
@@ -153,7 +145,7 @@ def search_products(
         "price_max": price_max,
         "category": category,
         "sort": sort,
-        "size": _clamp_size(size),
+        "size": _clamp_int(size, 100, 20),
         "exclude_without_ean": exclude_without_ean,
     })
     if unique and isinstance(data, dict) and isinstance(data.get("data"), list):
@@ -240,7 +232,7 @@ def search_stores(
         "lat": lat,
         "lng": lng,
         "km": km,
-        "size": _clamp_size(size),
+        "size": _clamp_int(size, 100, 20),
     })
 
 
@@ -253,10 +245,10 @@ def search_stores(
 # thresholds the value strictly exceeds (value > t), except the saturated-fat
 # ratio which uses value >= t.
 #
-# ponytail: "estimated" because Kassalapp exposes no FVLN % and no ingredient
-# list, so the fruit/veg/legume/nut score is guessed from category and the
-# 2023 non-nutritive-sweetener +4 penalty is not applied. Upgrade path: parse
-# ingredients for real FVLN and sweetener detection.
+# ponytail: "estimated" because Kassalapp exposes no fruits/vegetables/legumes %
+# and no ingredient list, so that score is guessed from category and the 2023
+# non-nutritive-sweetener +4 penalty is not applied. Upgrade path: parse
+# ingredients for real FVL and sweetener detection.
 # ---------------------------------------------------------------------------
 
 _T = {
@@ -277,9 +269,18 @@ _T = {
 }
 
 _KJ_PER_G_FAT = 37.0
-PRODUCE_FVLN = 100  # whole fruit/veg/legume/nut assumption for the override
+# Whole fruits/vegetables/legumes assumption for the produce override. (The 2023
+# FVLN positive component is fruits/vegetables/legumes only, nuts excluded.)
+PRODUCE_FVLN = 100
 _VALID_KINDS = ("general", "beverage", "fat_oil_nut", "cheese")
 RANK_MAX = 300  # hard cap on products a single ranking will fetch across pages
+
+
+def _validate_kind(kind_override):
+    """Return an error dict if kind_override is set but not a valid kind, else None."""
+    if kind_override is not None and kind_override not in _VALID_KINDS:
+        return {"error": f"kind_override must be one of {_VALID_KINDS}"}
+    return None
 
 _NCODES = {
     "energy_kj": "energi_kj", "energy_kcal": "energi_kcal",
@@ -410,8 +411,9 @@ def _cat_words(product):
     # Word tokens from category names only (curated), NOT the free-text product
     # name. Whole-word matching avoids the substring traps (ostekake, fruktyoghurt).
     names = [c.get("name", "") for c in (product.get("category") or []) if isinstance(c, dict)]
-    text = " ".join(names).lower()
-    return {w for w in "".join(ch if ch.isalpha() else " " for ch in text).split()}
+    # [^\W\d_]+ = runs of Unicode letters (matches str.isalpha, drops digits/punct),
+    # so behaviour is identical to the old join/split, just clearer.
+    return set(re.findall(r"[^\W\d_]+", " ".join(names).lower()))
 
 
 def _food_kind(product, override=None, tags=None):
@@ -454,14 +456,22 @@ def _fvln(product, override=None, tags=None):
     return PRODUCE_FVLN if _cat_words(product) & _KW_PRODUCE else 0
 
 
+# Score -> grade cutoffs (upper bound inclusive) per FSA-NPS 2023. Beverages have
+# no A except water; fats and general foods differ only at the A boundary.
+_GRADE_CUTOFFS = {
+    "beverage": [(2, "B"), (6, "C"), (9, "D")],
+    "fat_oil_nut": [(-6, "A"), (2, "B"), (10, "C"), (18, "D")],
+    "general": [(0, "A"), (2, "B"), (10, "C"), (18, "D")],
+}
+
+
 def _grade(score, kind, is_water=False):
-    if kind == "beverage":
-        if is_water:
-            return "A"
-        return "B" if score <= 2 else "C" if score <= 6 else "D" if score <= 9 else "E"
-    if kind == "fat_oil_nut":
-        return "A" if score <= -6 else "B" if score <= 2 else "C" if score <= 10 else "D" if score <= 18 else "E"
-    return "A" if score <= 0 else "B" if score <= 2 else "C" if score <= 10 else "D" if score <= 18 else "E"
+    if kind == "beverage" and is_water:
+        return "A"
+    for cutoff, grade in _GRADE_CUTOFFS.get(kind, _GRADE_CUTOFFS["general"]):
+        if score <= cutoff:
+            return grade
+    return "E"
 
 
 def _score(product, kind_override=None, fvln_override=None, tags=None):
@@ -571,21 +581,20 @@ def rank_by_nutrition(
 
     Uses the FSA-NPS 2023 algorithm on the products matching your filters, then
     sorts them. Same filters as search_products (search, store, brand, category).
-    size: how many products to fetch and rank, 1-100 (default 50).
+    size: how many products to fetch and rank, paged across the API, capped at 300
+      (default 50).
     kind_override: force the food type when the category is wrong or missing, one
       of "general", "beverage", "fat_oil_nut", "cheese".
 
-    Caveats: it is an ESTIMATE (Kassalapp exposes no fruit/veg content or
-    ingredient list, so that part is inferred from category). It ranks only
-    within the fetched set (size, paged, capped at 300), not the whole catalog.
-    Products without enough nutrition data are skipped and counted.
+    Caveats: it is an ESTIMATE (Kassalapp exposes no fruits/vegetables/legumes
+    content or ingredient list, so that part is inferred from category). It ranks
+    only within the fetched set (size, paged, capped at 300), not the whole
+    catalog. Products without enough nutrition data are skipped and counted.
     """
-    if kind_override is not None and kind_override not in _VALID_KINDS:
-        return {"error": f"kind_override must be one of {_VALID_KINDS}"}
-    try:
-        want = max(1, min(RANK_MAX, int(float(size))))
-    except (TypeError, ValueError):
-        want = 50
+    err = _validate_kind(kind_override)
+    if err:
+        return err
+    want = _clamp_int(size, RANK_MAX, 50)
     items, err = _fetch_products_paged(
         {"search": search, "store": store, "brand": brand, "category": category}, want)
     if err:
@@ -647,11 +656,12 @@ def nutrition_grade(
     Identify the product by ean or product_id. Returns the grade, the raw score,
     and the negative/positive point breakdown so the result is transparent.
     kind_override: force the food type ("general", "beverage", "fat_oil_nut",
-      "cheese") if the category is wrong. fvln_override: set the fruit/veg/nut
-      percent (0-100) directly instead of inferring it from category.
+      "cheese") if the category is wrong. fvln_override: set the
+      fruits/vegetables/legumes percent (0-100) directly instead of inferring it.
     """
-    if kind_override is not None and kind_override not in _VALID_KINDS:
-        return {"error": f"kind_override must be one of {_VALID_KINDS}"}
+    err = _validate_kind(kind_override)
+    if err:
+        return err
     if fvln_override is not None:
         if (isinstance(fvln_override, bool)  # bool is an int subclass, reject it
                 or not isinstance(fvln_override, (int, float))
@@ -686,7 +696,7 @@ def nutrition_grade(
     if ean_for_off and kind_override is None and fvln_override is None:
         try:
             off_res = off.off_grade(str(ean_for_off))
-        except Exception as e:
+        except (off.OffRateLimited, httpx.HTTPError, ValueError, OSError) as e:
             off_res, off_error = None, str(e)
         if off_res:
             return {
@@ -785,7 +795,12 @@ def _selftest() -> None:
     dd = _dedupe_by_ean([{"ean": "1"}, {"ean": "1"}, {"ean": "2"}, {"name": "x"}])
     assert len(dd) == 3, dd
     # size clamp
-    assert _clamp_size(100000) == 100 and _clamp_size(0) == 1 and _clamp_size("bad") == 20
+    assert _clamp_int(100000, 100, 20) == 100 and _clamp_int(0, 100, 20) == 1
+    assert _clamp_int("bad", 100, 20) == 20 and _clamp_int("50", 300, 50) == 50
+    assert _validate_kind("water") and _validate_kind(None) is None
+    # grade lookup: 2023 boundaries hold after the refactor
+    assert _grade(-6, "fat_oil_nut") == "A" and _grade(-5, "fat_oil_nut") == "B"
+    assert _grade(9, "beverage") == "D" and _grade(10, "beverage") == "E"
 
     # Spinach with produce FVLN override -> A
     s, _ = _score(mk({"energi_kj": 100, "mettet_fett": 0, "sukkerarter": 0.4,

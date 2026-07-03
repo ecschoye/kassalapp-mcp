@@ -9,7 +9,6 @@ per barcode, so we read it instead of guessing food type locally. Read limit is
 15 req/min/IP, so results are cached on disk (shared across processes with a file
 lock) and a file-backed rate guard keeps every process under the shared limit.
 """
-import atexit
 import json
 import os
 import sys
@@ -52,16 +51,6 @@ def _client() -> httpx.Client:
                 _client_ = httpx.Client(base_url=BASE, headers={"User-Agent": USER_AGENT},
                                         timeout=15.0)
     return _client_
-
-
-@atexit.register
-def _close_client() -> None:
-    global _client_
-    if _client_ is not None:
-        try:
-            _client_.close()
-        finally:
-            _client_ = None
 
 
 # --- paths ---------------------------------------------------------------
@@ -116,6 +105,8 @@ def _write_json(path, obj) -> None:
     tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())  # durable before rename, else a crash can leave junk
     os.replace(tmp, path)
 
 
@@ -161,26 +152,33 @@ def _prune(cache: dict) -> None:
 
 # --- rate limiter (file-backed sliding window, shared across processes) ---
 
-def _reserve_slot_locked() -> bool:
-    """Must be called while holding _locked(). Returns True and records a call if
-    the shared window has room, else False (no write on rejection)."""
+def _reserve_slot_locked():
+    """Must be called while holding _locked(). Records a call and returns its unique
+    timestamp token if the shared window has room, else None (no write on rejection).
+    The token is what _release_slot_locked refunds, so refunds are never misattributed
+    to another caller's reservation under cross-process interleaving."""
     now = time.time()
     calls = [t for t in _read_json(_rate_path(), []) if isinstance(t, (int, float))
              and t > now - RATE_WINDOW]
     if len(calls) >= RATE_LIMIT:
-        return False
+        return None
     calls.append(now)
     _write_json(_rate_path(), calls)
-    return True
+    return now
 
 
-def _release_slot_locked() -> None:
-    """Refund the most recently reserved slot (e.g. when the fetch failed), so a
-    transient OFF outage does not burn the shared minute budget on failures."""
+def _release_slot_locked(token) -> None:
+    """Refund the caller's OWN reserved slot (identified by its timestamp token), not
+    whatever happens to be last, so a transient failure does not un-count some other
+    in-flight request. No-op if the token already aged out of the window."""
+    if token is None:
+        return
     calls = _read_json(_rate_path(), [])
-    if calls:
-        calls.pop()
-        _write_json(_rate_path(), calls)
+    try:
+        calls.remove(token)
+    except ValueError:
+        return  # already expired/pruned; nothing to refund
+    _write_json(_rate_path(), calls)
 
 
 def _graded(data):
@@ -287,19 +285,19 @@ def off_grade(ean, use_cache: bool = True) -> dict | None:
         entry = cache.get(ean)
         if use_cache and _fresh(entry):
             return _graded(entry.get("data"))
-        reserved = _reserve_slot_locked()
-        stale = entry if (not reserved and _stale_ok(entry)) else None
+        token = _reserve_slot_locked()
+        stale = entry if (token is None and _stale_ok(entry)) else None
 
-    if not reserved:
+    if token is None:
         if stale is not None:
             return _graded(stale.get("data"))
         raise OffRateLimited("Open Food Facts rate limit reached (15/min). Try again shortly.")
 
     try:
         data = _fetch(ean)
-    except Exception:
+    except (httpx.HTTPError, ValueError):  # transport / bad-body only, not bugs
         with _locked():
-            _release_slot_locked()  # fetch failed, do not burn the slot
+            _release_slot_locked(token)  # fetch failed, refund our own slot
         raise
     result = _normalize(data, ean) if data else None
 
@@ -335,24 +333,27 @@ def off_grade_bulk(eans) -> dict:
             entry = cache.get(ean)
             if _fresh(entry):
                 out[ean] = {"status": "cache", "result": entry.get("data")}
-            elif _reserve_slot_locked():
-                to_fetch.append(ean)
+                continue
+            token = _reserve_slot_locked()
+            if token is not None:
+                to_fetch.append((ean, token))
             elif _stale_ok(entry):
                 out[ean] = {"status": "cache_stale", "result": entry.get("data")}
             else:
                 out[ean] = {"status": "skipped_rate_limited", "result": None}
 
     fetched = {}
-    for ean in to_fetch:
+    for ean, token in to_fetch:
         try:
             data = _fetch(ean)
-        except Exception as e:  # isolate: one failure must not abort the batch
+            result = _normalize(data, ean) if data else None
+        except (httpx.HTTPError, ValueError) as e:  # isolate one failure from the batch
             with _locked():
-                _release_slot_locked()
+                _release_slot_locked(token)  # refund this item's own slot
             out[ean] = {"status": "error", "result": None, "error": str(e)}
             continue
-        fetched[ean] = _normalize(data, ean) if data else None
-        out[ean] = {"status": "fetched", "result": _graded(fetched[ean])}
+        fetched[ean] = result
+        out[ean] = {"status": "fetched", "result": _graded(result)}
 
     if fetched:
         with _locked():
@@ -407,14 +408,22 @@ def _selftest() -> None:
     _prune(big)
     assert len(big) == MAX_ENTRIES and "9" not in big and str(MAX_ENTRIES + 9) in big
 
-    # file-backed rate limiter: 15 allowed, 16th blocked, shared via disk
-    os.environ.setdefault("KASSALAPP_CACHE_DIR",
-                           os.path.join(os.path.expanduser("~/.cache"), "kassalapp-mcp-selftest"))
+    # file-backed rate limiter: 15 allowed, 16th blocked, shared via disk. Use an
+    # isolated temp dir so the test never touches the real ~/.cache state.
+    import tempfile
+    os.environ["KASSALAPP_CACHE_DIR"] = tempfile.mkdtemp(prefix="kassalapp-off-test-")
     _write_json(_rate_path(), [])
     with _locked():
-        assert all(_reserve_slot_locked() for _ in range(RATE_LIMIT))
-        assert not _reserve_slot_locked()
-    _write_json(_rate_path(), [])  # reset
+        tokens = [_reserve_slot_locked() for _ in range(RATE_LIMIT)]
+        assert all(t is not None for t in tokens)
+        assert _reserve_slot_locked() is None  # window full
+    # refund removes the caller's OWN token, not whatever is last (misattribution bug)
+    _write_json(_rate_path(), [])
+    with _locked():
+        t1 = _reserve_slot_locked()
+        t2 = _reserve_slot_locked()
+        _release_slot_locked(t1)
+    assert _read_json(_rate_path(), []) == [t2]  # t2 must survive, not be popped
     print("off selftest ok (offline)")
 
     if "--live" in sys.argv:
