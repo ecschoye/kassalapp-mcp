@@ -20,6 +20,8 @@ Single file, no build step. `uv` reads the dependencies from the script header a
 | `compare_by_url` | Given a store product URL, return matching prices from all stores that stock it. |
 | `price_history` | Aggregated daily price history across stores for a list of EAN barcodes. |
 | `search_stores` | Find physical stores by name, chain, or proximity (lat/lng/radius). |
+| `rank_by_nutrition` | Rank products by estimated Nutri-Score, healthiest (A) to worst (E). Same filters as `search_products`. |
+| `nutrition_grade` | Estimated Nutri-Score (A-E) for one product by EAN or id, with the full point breakdown. |
 
 ## Requirements
 
@@ -63,6 +65,30 @@ Once connected, the tools are available to the assistant:
 - "What's the protein content of Kesam?" -> `search_products(search="kesam")`
 - "Compare prices for this product across stores" -> `compare_by_url(url="https://meny.no/...")`
 - "Price history for these barcodes" -> `price_history(eans=["7039010019811"], days=180)`
+
+## Nutrition score
+
+`rank_by_nutrition` and `nutrition_grade` compute an **estimated Nutri-Score** (A best,
+E worst) using the **FSA-NPS 2023 algorithm**, the model behind the European Nutri-Score
+label. It scores per 100g from negative components (energy, saturated fat, sugars, salt)
+minus positive components (fibre, protein, and fruit/vegetable/legume/nut content), with
+separate tables for beverages and for added fats/oils/nuts so food groups are judged
+fairly. The threshold tables are transcribed from the
+[Open Food Facts](https://github.com/openfoodfacts/openfoodfacts-server) production
+implementation of the Santé publique France workbook.
+
+It is an **estimate**, not the official grade, because:
+
+- Kassalapp exposes no fruit/vegetable/nut percentage (that needs composition data), so
+  that positive component is inferred from the product category. Whole produce categories
+  get a high default so they are not unfairly penalised.
+- Ingredients are not parsed, so the 2023 non-nutritive-sweetener penalty is not applied.
+- The food type (beverage / fat / cheese / general) is inferred from the category name,
+  with a `kind_override` argument to correct it.
+- `rank_by_nutrition` ranks only within the fetched result set (up to 100 items), not the
+  whole catalogue.
+
+The score is most reliable for comparing items **within a category** (e.g. all bread).
 
 ## Notes
 
